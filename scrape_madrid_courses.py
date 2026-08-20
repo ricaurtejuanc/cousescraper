@@ -274,7 +274,9 @@ def main():
             all_results.extend(rows)
             time.sleep(1)  # no martillear el servidor de la federación
 
-    with open("spain_courses_vc_vs.csv", "w", newline="", encoding="utf-8") as f:
+    # utf-8-sig añade el BOM que Excel necesita para detectar UTF-8 y no
+    # mostrar mal las tildes/eñes (si no, las interpreta como Windows-1252).
+    with open("spain_courses_vc_vs.csv", "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=["federacion", "club_code", "club_name", "recorrido", "tee", "genero", "vc", "vs", "par"],
