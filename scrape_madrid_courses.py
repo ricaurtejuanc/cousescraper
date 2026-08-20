@@ -1,11 +1,12 @@
 """
-Scraper de Vc (Course Rating) / Vs (Slope) para los campos de golf de Madrid
-afiliados a la Federación de Golf de Madrid (fedgolfmadrid.com).
+Scraper de Vc (Course Rating) / Vs (Slope) / Par para los campos de golf de
+Madrid afiliados a la Federación de Golf de Madrid (fedgolfmadrid.com).
 
-Filtra solo: BLANCAS (M), AMARILLAS (M), ROJAS (F) — los tees que necesita
-AfterGolf de momento.
+Filtra solo: BLANCAS/Hombre, AMARILLAS/Hombre, ROJAS/Mujer — los tees que
+necesita AfterGolf de momento. El color de tee y el género van en columnas
+separadas (tee, genero) en vez de mezclarlos en una sola etiqueta.
 
-Los valores de Vc/Vs NO están en el HTML estático de /club/{codigo}: la
+Los valores de Vc/Vs/Par NO están en el HTML estático de /club/{codigo}: la
 página los carga por AJAX (jQuery) una vez que el usuario elige un
 "trazado" (recorrido) y una "barra" (color de tee) en los <select> del
 formulario "Trazados". Este script replica esas mismas llamadas AJAX
@@ -22,6 +23,11 @@ directamente:
                                         "f": {"campo": Vc, "slope": Vs}}
                                        (campo = Vc, slope = Vs; hoyos=3
                                        pide el recorrido completo 1-18).
+  4. POST /ajax/datos-trazado?barra={id}&trazado={id}
+                                    -> {"m": {"par": [18 valores], ...},
+                                        "f": {"par": [18 valores], ...}}
+                                       Par total = suma de los 18 valores
+                                       numéricos de ese género.
 
 Las rutas AJAX se confirmaron leyendo /js/routing.js (FOSJsRoutingBundle)
 y /js/frontend/trazados_club.js.
@@ -67,12 +73,13 @@ CLUBS = [
     ("CME9", "LaFinca Golf"),
 ]
 
-# tee_label -> (fragmento a buscar en el nombre de la barra, clave de género en el JSON)
-TARGET_TEES = {
-    "BLANCAS (M)": ("BLANCA", "m"),
-    "AMARILLAS (M)": ("AMARILLA", "m"),
-    "ROJAS (F)": ("ROJA", "f"),
-}
+# (color de tee, género "H"/"M", fragmento a buscar en el nombre de la barra,
+#  clave de género en el JSON de la API)
+TARGET_TEES = [
+    ("BLANCAS", "H", "BLANCA", "m"),
+    ("AMARILLAS", "H", "AMARILLA", "m"),
+    ("ROJAS", "M", "ROJA", "f"),
+]
 
 BASE_URL = "https://fedgolfmadrid.com"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AfterGolfDataBot/1.0)"}
@@ -118,6 +125,20 @@ def get_valores(session, trazado_id, barra_id):
     return r.json()
 
 
+def get_par(session, trazado_id, barra_id, gender_key):
+    """Suma el par de los 18 hoyos para trazado+barra+género (None si no hay datos)."""
+    r = session.post(
+        f"{BASE_URL}/ajax/datos-trazado",
+        params={"barra": barra_id, "trazado": trazado_id},
+        headers=AJAX_HEADERS,
+        timeout=15,
+    )
+    r.raise_for_status()
+    pares = r.json().get(gender_key, {}).get("par", [])
+    numericos = [p for p in pares if isinstance(p, (int, float))]
+    return sum(numericos) if numericos else None
+
+
 def scrape_club(session, code, name):
     results = []
     try:
@@ -133,7 +154,7 @@ def scrape_club(session, code, name):
             print(f"  ERROR barras {name} ({code}) / {recorrido}: {e}")
             continue
 
-        for tee_label, (needle, gender) in TARGET_TEES.items():
+        for tee_color, genero, needle, gender_key in TARGET_TEES:
             barra = next(
                 (b for b in barras if needle in b.get("nombre", "").upper()),
                 None,
@@ -144,23 +165,31 @@ def scrape_club(session, code, name):
             try:
                 valores = get_valores(session, trazado_id, barra["id"])
             except Exception as e:
-                print(f"  ERROR valores {name} ({code}) / {recorrido} / {tee_label}: {e}")
+                print(f"  ERROR valores {name} ({code}) / {recorrido} / {tee_color} {genero}: {e}")
                 continue
 
-            datos = valores.get(gender, {})
+            datos = valores.get(gender_key, {})
             vc = datos.get("campo")
             vs = datos.get("slope")
             if not vc and not vs:
                 # el club no tiene datos cargados para esta combinación
                 continue
 
+            try:
+                par = get_par(session, trazado_id, barra["id"], gender_key)
+            except Exception as e:
+                print(f"  ERROR par {name} ({code}) / {recorrido} / {tee_color} {genero}: {e}")
+                par = None
+
             results.append({
                 "club_code": code,
                 "club_name": name,
                 "recorrido": recorrido,
-                "tee": tee_label,
+                "tee": tee_color,
+                "genero": genero,
                 "vc": vc,
                 "vs": vs,
+                "par": par,
             })
             time.sleep(0.2)  # no martillear el servidor de la federación
 
@@ -175,16 +204,16 @@ def main():
     for code, name in CLUBS:
         print(f"Scraping {name} ({code})...")
         rows = scrape_club(session, code, name)
-        found_tees = {r["tee"] for r in rows}
-        for tee in TARGET_TEES:
-            if tee not in found_tees:
-                missing.append(f"{name} ({code}) — falta {tee}")
+        found = {(r["tee"], r["genero"]) for r in rows}
+        for tee_color, genero, _, _ in TARGET_TEES:
+            if (tee_color, genero) not in found:
+                missing.append(f"{name} ({code}) — falta {tee_color} ({genero})")
         all_results.extend(rows)
         time.sleep(1)  # no martillear el servidor de la federación
 
     with open("madrid_courses_vc_vs.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["club_code", "club_name", "recorrido", "tee", "vc", "vs"]
+            f, fieldnames=["club_code", "club_name", "recorrido", "tee", "genero", "vc", "vs", "par"]
         )
         writer.writeheader()
         writer.writerows(all_results)
