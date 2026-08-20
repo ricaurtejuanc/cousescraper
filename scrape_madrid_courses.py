@@ -1,36 +1,48 @@
 """
 Scraper de Vc (Course Rating) / Vs (Slope) / Par para los campos de golf de
-Madrid afiliados a la Federación de Golf de Madrid (fedgolfmadrid.com).
+España, federación por federación (portales autonómicos de golf).
 
 Filtra solo: BLANCAS/Hombre, AMARILLAS/Hombre, ROJAS/Mujer — los tees que
 necesita AfterGolf de momento. El color de tee y el género van en columnas
 separadas (tee, genero) en vez de mezclarlos en una sola etiqueta.
 
-Los valores de Vc/Vs/Par NO están en el HTML estático de /club/{codigo}: la
-página los carga por AJAX (jQuery) una vez que el usuario elige un
+De las 17 federaciones autonómicas investigadas, solo Madrid y Andalucía
+corren sobre la misma plataforma (un backend Symfony con FOSJsRoutingBundle
+que expone rutas AJAX idénticas, solo con distinto prefijo). El resto usa
+plataformas propias (WordPress, sitios a medida) que no publican Vc/Vs de
+forma estructurada — Cataluña (catgolf.com), por ejemplo, solo tiene texto
+libre con par/metros, sin Vc/Vs en ningún lado del HTML.
+
+Los valores de Vc/Vs/Par NO están en el HTML estático de la ficha de club:
+la página los carga por AJAX (jQuery) una vez que el usuario elige un
 "trazado" (recorrido) y una "barra" (color de tee) en los <select> del
 formulario "Trazados". Este script replica esas mismas llamadas AJAX
-directamente:
+directamente para cada federación soportada:
 
-  1. GET /club/{codigo}            -> <select id="trazados"> con los
-                                       recorridos del club (id + nombre).
-  2. POST /ajax/barras-trazado?trazado={id}
+  1. GET {club_url}                -> <select id="trazados"|"trazados_aux">
+                                       con los recorridos del club (id +
+                                       nombre).
+  2. POST {ajax_prefix}/barras-trazado?trazado={id}
                                     -> lista de barras (tees) disponibles
                                        para ese recorrido: [{id, nombre,
                                        color}, ...].
-  3. POST /ajax/trazadobarra-valores?barra={id}&trazado={id}&hoyos=3
+  3. POST {ajax_prefix}/trazadobarra-valores?barra={id}&trazado={id}&hoyos=3
                                     -> {"m": {"campo": Vc, "slope": Vs},
                                         "f": {"campo": Vc, "slope": Vs}}
                                        (campo = Vc, slope = Vs; hoyos=3
                                        pide el recorrido completo 1-18).
-  4. POST /ajax/datos-trazado?barra={id}&trazado={id}
+  4. POST {ajax_prefix}/datos-trazado?barra={id}&trazado={id}
                                     -> {"m": {"par": [18 valores], ...},
                                         "f": {"par": [18 valores], ...}}
                                        Par total = suma de los 18 valores
                                        numéricos de ese género.
 
+Andalucía además expone un listado completo de clubes vía AJAX
+({ajax_prefix}/clubes-provincias, sin parámetros), así que su lista de
+clubes se obtiene en tiempo de ejecución en vez de estar hardcodeada.
+
 Las rutas AJAX se confirmaron leyendo /js/routing.js (FOSJsRoutingBundle)
-y /js/frontend/trazados_club.js.
+de cada sitio.
 
 Requisitos: pip install requests beautifulsoup4
 """
@@ -41,7 +53,7 @@ import csv
 import time
 
 # Los 29 campos de Madrid con instalación jugable (fuente: fedgolfmadrid.com/club/lista)
-CLUBS = [
+MADRID_CLUBS = [
     ("CM01", "Real Club Puerta de Hierro"),
     ("CM02", "Real Club de Campo Villa de Madrid"),
     ("CM03", "C.d.s.c.e.a. Barberán y Collar"),
@@ -81,17 +93,62 @@ TARGET_TEES = [
     ("ROJAS", "M", "ROJA", "f"),
 ]
 
-BASE_URL = "https://fedgolfmadrid.com"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AfterGolfDataBot/1.0)"}
 AJAX_HEADERS = {**HEADERS, "X-Requested-With": "XMLHttpRequest"}
 
+# Federaciones confirmadas sobre la misma plataforma AJAX. Cada entrada:
+#  - base_url: dominio del portal
+#  - ajax_prefix: prefijo de las rutas AJAX (varía por federación)
+#  - club_url: plantilla de la ficha de club (varía el idioma/ruta)
+#  - trazado_select_id: id del <select> con los recorridos (varía el markup)
+#  - clubs: lista estática [(code, name), ...], o None para obtenerla por AJAX
+FEDERATIONS = [
+    {
+        "key": "madrid",
+        "name": "Madrid",
+        "base_url": "https://fedgolfmadrid.com",
+        "ajax_prefix": "/ajax",
+        "club_url": "/club/{code}",
+        "trazado_select_id": "trazados",
+        "clubs": MADRID_CLUBS,
+    },
+    {
+        "key": "andalucia",
+        "name": "Andalucía",
+        "base_url": "https://portal.golfandalucia.com",
+        "ajax_prefix": "/nodo/ajax",
+        "club_url": "/es/club/{code}",
+        "trazado_select_id": "trazados_aux",
+        "clubs": None,
+    },
+]
 
-def get_trazados(session, code):
+
+def get_club_list(session, fed):
+    """Devuelve [(code, name), ...] para una federación (estática o vía AJAX)."""
+    if fed["clubs"] is not None:
+        return fed["clubs"]
+
+    r = session.post(
+        f"{fed['base_url']}{fed['ajax_prefix']}/clubes-provincias",
+        headers=AJAX_HEADERS,
+        timeout=15,
+    )
+    r.raise_for_status()
+    con_campo = r.json().get("con", {})
+    return sorted(
+        ((code, info["nombre"]) for code, info in con_campo.items()),
+        key=lambda x: x[0],
+    )
+
+
+def get_trazados(session, fed, code):
     """Devuelve [(trazado_id, nombre_recorrido), ...] para un club."""
-    r = session.get(f"{BASE_URL}/club/{code}", headers=HEADERS, timeout=15)
+    url = fed["base_url"] + fed["club_url"].format(code=code)
+    r = session.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    select = soup.find("select", id="trazados")
+    select = soup.find("select", id=fed["trazado_select_id"])
     if not select:
         return []
     return [
@@ -101,10 +158,10 @@ def get_trazados(session, code):
     ]
 
 
-def get_barras(session, trazado_id):
+def get_barras(session, fed, trazado_id):
     """Devuelve [{"id", "nombre", "color"}, ...] disponibles para un recorrido."""
     r = session.post(
-        f"{BASE_URL}/ajax/barras-trazado",
+        f"{fed['base_url']}{fed['ajax_prefix']}/barras-trazado",
         params={"trazado": trazado_id},
         headers=AJAX_HEADERS,
         timeout=15,
@@ -113,10 +170,10 @@ def get_barras(session, trazado_id):
     return r.json()
 
 
-def get_valores(session, trazado_id, barra_id):
+def get_valores(session, fed, trazado_id, barra_id):
     """Devuelve {"m": {"campo": Vc, "slope": Vs}, "f": {...}} para trazado+barra."""
     r = session.post(
-        f"{BASE_URL}/ajax/trazadobarra-valores",
+        f"{fed['base_url']}{fed['ajax_prefix']}/trazadobarra-valores",
         params={"barra": barra_id, "trazado": trazado_id, "hoyos": 3},
         headers=AJAX_HEADERS,
         timeout=15,
@@ -125,10 +182,10 @@ def get_valores(session, trazado_id, barra_id):
     return r.json()
 
 
-def get_par(session, trazado_id, barra_id, gender_key):
+def get_par(session, fed, trazado_id, barra_id, gender_key):
     """Suma el par de los 18 hoyos para trazado+barra+género (None si no hay datos)."""
     r = session.post(
-        f"{BASE_URL}/ajax/datos-trazado",
+        f"{fed['base_url']}{fed['ajax_prefix']}/datos-trazado",
         params={"barra": barra_id, "trazado": trazado_id},
         headers=AJAX_HEADERS,
         timeout=15,
@@ -139,17 +196,17 @@ def get_par(session, trazado_id, barra_id, gender_key):
     return sum(numericos) if numericos else None
 
 
-def scrape_club(session, code, name):
+def scrape_club(session, fed, code, name):
     results = []
     try:
-        trazados = get_trazados(session, code)
+        trazados = get_trazados(session, fed, code)
     except Exception as e:
         print(f"  ERROR fetching {name} ({code}): {e}")
         return results
 
     for trazado_id, recorrido in trazados:
         try:
-            barras = get_barras(session, trazado_id)
+            barras = get_barras(session, fed, trazado_id)
         except Exception as e:
             print(f"  ERROR barras {name} ({code}) / {recorrido}: {e}")
             continue
@@ -163,7 +220,7 @@ def scrape_club(session, code, name):
                 continue
 
             try:
-                valores = get_valores(session, trazado_id, barra["id"])
+                valores = get_valores(session, fed, trazado_id, barra["id"])
             except Exception as e:
                 print(f"  ERROR valores {name} ({code}) / {recorrido} / {tee_color} {genero}: {e}")
                 continue
@@ -176,12 +233,13 @@ def scrape_club(session, code, name):
                 continue
 
             try:
-                par = get_par(session, trazado_id, barra["id"], gender_key)
+                par = get_par(session, fed, trazado_id, barra["id"], gender_key)
             except Exception as e:
                 print(f"  ERROR par {name} ({code}) / {recorrido} / {tee_color} {genero}: {e}")
                 par = None
 
             results.append({
+                "federacion": fed["name"],
                 "club_code": code,
                 "club_name": name,
                 "recorrido": recorrido,
@@ -201,24 +259,30 @@ def main():
     missing = []
     session = requests.Session()
 
-    for code, name in CLUBS:
-        print(f"Scraping {name} ({code})...")
-        rows = scrape_club(session, code, name)
-        found = {(r["tee"], r["genero"]) for r in rows}
-        for tee_color, genero, _, _ in TARGET_TEES:
-            if (tee_color, genero) not in found:
-                missing.append(f"{name} ({code}) — falta {tee_color} ({genero})")
-        all_results.extend(rows)
-        time.sleep(1)  # no martillear el servidor de la federación
+    for fed in FEDERATIONS:
+        print(f"=== Federación: {fed['name']} ===")
+        clubs = get_club_list(session, fed)
+        print(f"  {len(clubs)} clubes encontrados")
 
-    with open("madrid_courses_vc_vs.csv", "w", newline="", encoding="utf-8") as f:
+        for code, name in clubs:
+            print(f"Scraping {name} ({code})...")
+            rows = scrape_club(session, fed, code, name)
+            found = {(r["tee"], r["genero"]) for r in rows}
+            for tee_color, genero, _, _ in TARGET_TEES:
+                if (tee_color, genero) not in found:
+                    missing.append(f"{fed['name']} — {name} ({code}) — falta {tee_color} ({genero})")
+            all_results.extend(rows)
+            time.sleep(1)  # no martillear el servidor de la federación
+
+    with open("spain_courses_vc_vs.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["club_code", "club_name", "recorrido", "tee", "genero", "vc", "vs", "par"]
+            f,
+            fieldnames=["federacion", "club_code", "club_name", "recorrido", "tee", "genero", "vc", "vs", "par"],
         )
         writer.writeheader()
         writer.writerows(all_results)
 
-    print(f"\n✅ {len(all_results)} filas guardadas en madrid_courses_vc_vs.csv")
+    print(f"\n✅ {len(all_results)} filas guardadas en spain_courses_vc_vs.csv")
 
     if missing:
         print(f"\n⚠️  {len(missing)} combinaciones tee/club no encontradas "
