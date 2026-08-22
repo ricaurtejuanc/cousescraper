@@ -32,10 +32,21 @@ directamente para cada federación soportada:
                                        (campo = Vc, slope = Vs; hoyos=3
                                        pide el recorrido completo 1-18).
   4. POST {ajax_prefix}/datos-trazado?barra={id}&trazado={id}
-                                    -> {"m": {"par": [18 valores], ...},
-                                        "f": {"par": [18 valores], ...}}
-                                       Par total = suma de los 18 valores
-                                       numéricos de ese género.
+                                    -> {"m": {"metros": [18], "par": [18],
+                                              "hcp": [18]},
+                                        "f": {...}}
+                                       Tarjeta hoyo a hoyo (1-18) de ese
+                                       género: metros, par y hándicap del
+                                       hoyo. Par total = suma de "par".
+
+Salidas:
+  - spain_courses_vc_vs.csv     -> una fila por club+recorrido+tee+género,
+                                    con Vc/Vs/Par total.
+  - spain_courses_tarjetas.csv  -> una fila por hoyo (formato normalizado,
+                                    listo para cargar en base de datos y
+                                    filtrar/pivotar por tee en la web).
+                                    Se une con el CSV anterior por
+                                    (trazado_id, barra_id, genero).
 
 Andalucía además expone un listado completo de clubes vía AJAX
 ({ajax_prefix}/clubes-provincias, sin parámetros), así que su lista de
@@ -182,8 +193,10 @@ def get_valores(session, fed, trazado_id, barra_id):
     return r.json()
 
 
-def get_par(session, fed, trazado_id, barra_id, gender_key):
-    """Suma el par de los 18 hoyos para trazado+barra+género (None si no hay datos)."""
+def get_tarjeta(session, fed, trazado_id, barra_id, gender_key):
+    """Devuelve la tarjeta hoyo a hoyo para trazado+barra+género:
+    [{"hoyo": 1..18, "metros": int, "par": int, "hcp": int}, ...] (lista
+    vacía si el club no tiene datos cargados para esa combinación)."""
     r = session.post(
         f"{fed['base_url']}{fed['ajax_prefix']}/datos-trazado",
         params={"barra": barra_id, "trazado": trazado_id},
@@ -191,18 +204,31 @@ def get_par(session, fed, trazado_id, barra_id, gender_key):
         timeout=15,
     )
     r.raise_for_status()
-    pares = r.json().get(gender_key, {}).get("par", [])
-    numericos = [p for p in pares if isinstance(p, (int, float))]
-    return sum(numericos) if numericos else None
+    datos = r.json().get(gender_key, {})
+    metros = datos.get("metros", [])
+    pares = datos.get("par", [])
+    hcps = datos.get("hcp", [])
+    hoyos = []
+    for i, (m, p, h) in enumerate(zip(metros, pares, hcps), start=1):
+        if not isinstance(p, (int, float)):
+            continue  # "-": el club no cargó datos para este hoyo/género
+        hoyos.append({
+            "hoyo": i,
+            "metros": m if isinstance(m, (int, float)) else None,
+            "par": p,
+            "hcp": h if isinstance(h, (int, float)) else None,
+        })
+    return hoyos
 
 
 def scrape_club(session, fed, code, name):
     results = []
+    tarjetas = []
     try:
         trazados = get_trazados(session, fed, code)
     except Exception as e:
         print(f"  ERROR fetching {name} ({code}): {e}")
-        return results
+        return results, tarjetas
 
     for trazado_id, recorrido in trazados:
         try:
@@ -233,29 +259,50 @@ def scrape_club(session, fed, code, name):
                 continue
 
             try:
-                par = get_par(session, fed, trazado_id, barra["id"], gender_key)
+                hoyos = get_tarjeta(session, fed, trazado_id, barra["id"], gender_key)
             except Exception as e:
-                print(f"  ERROR par {name} ({code}) / {recorrido} / {tee_color} {genero}: {e}")
-                par = None
+                print(f"  ERROR tarjeta {name} ({code}) / {recorrido} / {tee_color} {genero}: {e}")
+                hoyos = []
+            par = sum(h["par"] for h in hoyos) if hoyos else None
 
             results.append({
                 "federacion": fed["name"],
                 "club_code": code,
                 "club_name": name,
+                "trazado_id": trazado_id,
                 "recorrido": recorrido,
+                "barra_id": barra["id"],
                 "tee": tee_color,
                 "genero": genero,
                 "vc": vc,
                 "vs": vs,
                 "par": par,
             })
+
+            for h in hoyos:
+                tarjetas.append({
+                    "federacion": fed["name"],
+                    "club_code": code,
+                    "club_name": name,
+                    "trazado_id": trazado_id,
+                    "recorrido": recorrido,
+                    "barra_id": barra["id"],
+                    "tee": tee_color,
+                    "genero": genero,
+                    "hoyo": h["hoyo"],
+                    "metros": h["metros"],
+                    "par": h["par"],
+                    "hcp": h["hcp"],
+                })
+
             time.sleep(0.2)  # no martillear el servidor de la federación
 
-    return results
+    return results, tarjetas
 
 
 def main():
     all_results = []
+    all_tarjetas = []
     missing = []
     session = requests.Session()
 
@@ -266,12 +313,13 @@ def main():
 
         for code, name in clubs:
             print(f"Scraping {name} ({code})...")
-            rows = scrape_club(session, fed, code, name)
+            rows, tarjetas = scrape_club(session, fed, code, name)
             found = {(r["tee"], r["genero"]) for r in rows}
             for tee_color, genero, _, _ in TARGET_TEES:
                 if (tee_color, genero) not in found:
                     missing.append(f"{fed['name']} — {name} ({code}) — falta {tee_color} ({genero})")
             all_results.extend(rows)
+            all_tarjetas.extend(tarjetas)
             time.sleep(1)  # no martillear el servidor de la federación
 
     # utf-8-sig añade el BOM que Excel necesita para detectar UTF-8 y no
@@ -279,12 +327,30 @@ def main():
     with open("spain_courses_vc_vs.csv", "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["federacion", "club_code", "club_name", "recorrido", "tee", "genero", "vc", "vs", "par"],
+            fieldnames=[
+                "federacion", "club_code", "club_name", "trazado_id", "recorrido",
+                "barra_id", "tee", "genero", "vc", "vs", "par",
+            ],
         )
         writer.writeheader()
         writer.writerows(all_results)
 
+    # Tabla normalizada (una fila por hoyo) para cargar en base de datos y
+    # poder filtrar/pivotar por tee en la web. trazado_id + barra_id + genero
+    # son la clave para unirla con spain_courses_vc_vs.csv.
+    with open("spain_courses_tarjetas.csv", "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "federacion", "club_code", "club_name", "trazado_id", "recorrido",
+                "barra_id", "tee", "genero", "hoyo", "metros", "par", "hcp",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(all_tarjetas)
+
     print(f"\n✅ {len(all_results)} filas guardadas en spain_courses_vc_vs.csv")
+    print(f"✅ {len(all_tarjetas)} filas (hoyo a hoyo) guardadas en spain_courses_tarjetas.csv")
 
     if missing:
         print(f"\n⚠️  {len(missing)} combinaciones tee/club no encontradas "
