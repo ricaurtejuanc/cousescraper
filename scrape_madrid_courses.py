@@ -6,12 +6,18 @@ Filtra solo: BLANCAS/Hombre, AMARILLAS/Hombre, ROJAS/Mujer — los tees que
 necesita AfterGolf de momento. El color de tee y el género van en columnas
 separadas (tee, genero) en vez de mezclarlos en una sola etiqueta.
 
-De las 17 federaciones autonómicas investigadas, solo Madrid y Andalucía
-corren sobre la misma plataforma (un backend Symfony con FOSJsRoutingBundle
-que expone rutas AJAX idénticas, solo con distinto prefijo). El resto usa
-plataformas propias (WordPress, sitios a medida) que no publican Vc/Vs de
-forma estructurada — Cataluña (catgolf.com), por ejemplo, solo tiene texto
-libre con par/metros, sin Vc/Vs en ningún lado del HTML.
+De las 17 federaciones autonómicas investigadas, tres publican Vc/Vs de
+forma estructurada:
+  - Madrid y Andalucía corren sobre la misma plataforma (un backend Symfony
+    con FOSJsRoutingBundle que expone rutas AJAX idénticas, solo con
+    distinto prefijo) — ver detalle de las rutas más abajo.
+  - Galicia (fggolf.com) usa una plataforma propia (ASP.NET WebForms) que
+    publica Vc/Vs/Par por tee+género directamente en el HTML estático de la
+    ficha de club, sin AJAX — ver scrape_galicia_club().
+El resto usa plataformas propias (mayormente WordPress) que no publican
+Vc/Vs de forma estructurada — Cataluña (catgolf.com), Aragón, Asturias y
+Canarias, por ejemplo, solo tienen texto libre con par/metros o enlazan a
+la web de cada club, sin Vc/Vs en ningún lado del HTML.
 
 Los valores de Vc/Vs/Par NO están en el HTML estático de la ficha de club:
 la página los carga por AJAX (jQuery) una vez que el usuario elige un
@@ -58,10 +64,24 @@ de cada sitio.
 Requisitos: pip install requests beautifulsoup4
 """
 
+import re
 import requests
 from bs4 import BeautifulSoup
 import csv
 import time
+
+
+def fetch(session, url, retries=3, **kwargs):
+    """GET con reintentos: fggolf.com resetea la conexión de forma intermitente."""
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=15, **kwargs)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException:
+            if attempt == retries - 1:
+                raise
+            time.sleep(2)
 
 # Los 29 campos de Madrid con instalación jugable (fuente: fedgolfmadrid.com/club/lista)
 MADRID_CLUBS = [
@@ -133,6 +153,124 @@ FEDERATIONS = [
         "clubs": None,
     },
 ]
+
+# --- Galicia (fggolf.com) ---------------------------------------------------
+# Plataforma distinta (ASP.NET WebForms): a diferencia de Madrid/Andalucía,
+# el Vc/Vs/Par por tee+género viene ya en el HTML estático de la ficha de
+# club, sin AJAX. Cada club puede tener varios recorridos; cada recorrido
+# tiene un bloque <h3 class="nombreCampo"> seguido de un <div class="cajaCampo">
+# que contiene:
+#   - div.cajaBarras: una <li> por barra (tee), con el color (estilo inline),
+#     slope, valor (Vc) y par — pero SIN el nombre/género de la barra.
+#   - select[id*=ddlBarras] (del calculador de hándicap): las mismas barras,
+#     en el mismo orden, mostrando el nombre real ("Rojas Damas", "Barras
+#     amarillas caballeros", ...) del que sacamos color+género.
+# No expone tarjeta hoyo a hoyo (solo el par total), así que Galicia no
+# aporta filas a spain_courses_tarjetas.csv.
+GALICIA_BASE_URL = "https://www.fggolf.com"
+
+
+def get_galicia_club_list(session):
+    """Devuelve [(slug, name), ...] leyendo el directorio /campos.aspx."""
+    r = fetch(session, f"{GALICIA_BASE_URL}/campos.aspx", headers=HEADERS)
+    soup = BeautifulSoup(r.text, "html.parser")
+    clubs = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not (href.startswith("campos/") and href.endswith(".aspx")):
+            continue
+        slug = href[len("campos/"):-len(".aspx")]
+        text = a.get_text(strip=True)
+        if text and "ver información" not in text.lower():
+            clubs.setdefault(slug, text)
+    return sorted(clubs.items())
+
+
+def _parse_num_coma(text):
+    """'68,6' -> 68.6 ; '0' -> 0.0 ; '-'/'' -> None."""
+    text = (text or "").strip().replace(",", ".")
+    if not text or text == "-":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def scrape_galicia_club(session, slug, name):
+    results = []
+    tarjetas = []  # Galicia no expone tarjeta hoyo a hoyo
+    try:
+        r = fetch(session, f"{GALICIA_BASE_URL}/campos/{slug}.aspx", headers=HEADERS)
+    except Exception as e:
+        print(f"  ERROR fetching {name} ({slug}): {e}")
+        return results, tarjetas
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    for idx, h3 in enumerate(soup.find_all("h3", class_="nombreCampo"), start=1):
+        recorrido = h3.get_text(strip=True) or f"Recorrido {idx}"
+        caja_campo = h3.find_next_sibling("div", class_="cajaCampo")
+        if not caja_campo:
+            continue
+
+        caja_barras = caja_campo.find("div", class_="cajaBarras")
+        select = caja_campo.find("select", id=re.compile("ddlBarras"))
+        if not caja_barras or not select:
+            continue
+
+        items = caja_barras.find_all("li")
+        options = select.find_all("option")
+        if len(items) != len(options):
+            print(f"  ⚠️  {name} ({slug}) / {recorrido}: {len(items)} barras vs "
+                  f"{len(options)} opciones — desajuste, se omite")
+            continue
+
+        vistos = set()  # algunos clubes repiten la misma barra con 2 ids distintos
+        for li, opt in zip(items, options):
+            slope = _parse_num_coma(li.find("span", class_="slope").get_text())
+            valor = _parse_num_coma(li.find("span", class_="valor").get_text())
+            par = _parse_num_coma(li.find("span", class_="par").get_text())
+            barra_id = opt.get("value")
+            nombre_barra = opt.get_text(strip=True).upper()
+
+            if not slope or not valor or not par:
+                continue  # barra vacía/no configurada en el club
+
+            if "CABALLERO" in nombre_barra:
+                genero = "H"
+            elif "DAMA" in nombre_barra:
+                genero = "M"
+            else:
+                continue  # no se puede determinar el género con confianza
+
+            tee_color = next(
+                (color for color, g, needle, _ in TARGET_TEES
+                 if g == genero and needle in nombre_barra),
+                None,
+            )
+            if not tee_color:
+                continue  # combinación color/género que no nos interesa
+            if (tee_color, genero) in vistos:
+                continue  # barra duplicada en la web de origen
+            vistos.add((tee_color, genero))
+
+            results.append({
+                "federacion": "Galicia",
+                "club_code": slug,
+                "club_name": name,
+                "trazado_id": f"{slug}-{idx}",
+                "recorrido": recorrido,
+                "barra_id": barra_id,
+                "tee": tee_color,
+                "genero": genero,
+                "vc": valor,
+                "vs": int(slope),
+                "par": int(par),
+            })
+
+        time.sleep(0.2)  # no martillear el servidor de la federación
+
+    return results, tarjetas
 
 
 def get_club_list(session, fed):
@@ -321,6 +459,20 @@ def main():
             all_results.extend(rows)
             all_tarjetas.extend(tarjetas)
             time.sleep(1)  # no martillear el servidor de la federación
+
+    print("=== Federación: Galicia ===")
+    galicia_clubs = get_galicia_club_list(session)
+    print(f"  {len(galicia_clubs)} clubes encontrados")
+    for slug, name in galicia_clubs:
+        print(f"Scraping {name} ({slug})...")
+        rows, tarjetas = scrape_galicia_club(session, slug, name)
+        found = {(r["tee"], r["genero"]) for r in rows}
+        for tee_color, genero, _, _ in TARGET_TEES:
+            if (tee_color, genero) not in found:
+                missing.append(f"Galicia — {name} ({slug}) — falta {tee_color} ({genero})")
+        all_results.extend(rows)
+        all_tarjetas.extend(tarjetas)
+        time.sleep(1)  # no martillear el servidor de la federación
 
     # utf-8-sig añade el BOM que Excel necesita para detectar UTF-8 y no
     # mostrar mal las tildes/eñes (si no, las interpreta como Windows-1252).
